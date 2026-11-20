@@ -53,10 +53,10 @@ const RULES_TEMPLATE: &str = "\
 # `!<label>` hides a row. An app name in a `+`/`!` line covers all of its profiles.
 # `hop list` prints the labels. `hop rules` opens this file.
 #
-# +Google Chrome (Work)
+# +Google Chrome (Acme)
 # +Safari
-# !T3 Code (Beta)
-# github.com/acme = Google Chrome (Work)
+# !Microsoft Teams
+# github.com/acme = Google Chrome (Acme)
 # youtube.com = Safari
 # figma.com = Figma
 ";
@@ -301,6 +301,10 @@ impl Hop {
         self.setNeedsDisplay(true);
         #[cfg(debug_assertions)] // dev only: `HOP_SNAPSHOT=out.png target/debug/hop <url>` renders the picker without showing it
         if let Some(out) = std::env::var("HOP_SNAPSHOT").ok() {
+            use objc2_app_kit::{NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
+            let look = unsafe { if std::env::var_os("HOP_DARK").is_some() { NSAppearanceNameDarkAqua } else { NSAppearanceNameAqua } };
+            self.setAppearance(NSAppearance::appearanceNamed(look).as_deref());
+            st.alt.set(false); // the screenshot must not depend on the keys held right now
             let rep = self.bitmapImageRepForCachingDisplayInRect(self.bounds()).unwrap();
             self.cacheDisplayInRect_toBitmapImageRep(self.bounds(), &rep);
             let png = unsafe { rep.representationUsingType_properties(objc2_app_kit::NSBitmapImageFileType::PNG, &NSDictionary::new()) };
@@ -452,6 +456,15 @@ impl Hop {
         let st = self.ivars();
         let session = st.session.borrow();
         let Some(s) = session.as_ref() else { return };
+        #[cfg(debug_assertions)]
+        if std::env::var_os("HOP_SNAPSHOT").is_some() {
+            // The glass does not render off screen, so a plain card stands in for it.
+            let card = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(self.bounds(), 18.0, 18.0);
+            NSColor::windowBackgroundColor().setFill();
+            card.fill();
+            NSColor::separatorColor().setStroke();
+            card.stroke();
+        }
         let size = self.bounds().size;
         let (w, h) = (size.width, size.height);
         let (label, dim, faint) = (NSColor::labelColor(), NSColor::secondaryLabelColor(), NSColor::tertiaryLabelColor());
@@ -1093,11 +1106,11 @@ mod tests {
 
     #[test]
     fn rules_match_domains_and_paths() {
-        let rules = "# c\nyoutube.com = Safari\ngithub.com/acme = Google Chrome (Work)  # work\ngithub.com = Firefox\n";
+        let rules = "# c\nyoutube.com = Safari\ngithub.com/acme = Google Chrome (Acme)  # acme\ngithub.com = Firefox\n";
         assert_eq!(find_rule(rules, "www.youtube.com", "/watch").as_deref(), Some("Safari"));
         assert_eq!(find_rule(rules, "notyoutube.com", "/"), None);
-        assert_eq!(find_rule(rules, "github.com", "/Acme/repo").as_deref(), Some("Google Chrome (Work)"));
-        assert_eq!(find_rule(rules, "github.com", "/acme").as_deref(), Some("Google Chrome (Work)"));
+        assert_eq!(find_rule(rules, "github.com", "/Acme/repo").as_deref(), Some("Google Chrome (Acme)"));
+        assert_eq!(find_rule(rules, "github.com", "/acme").as_deref(), Some("Google Chrome (Acme)"));
         assert_eq!(find_rule(rules, "github.com", "/acmex/repo").as_deref(), Some("Firefox"));
         assert_eq!(find_rule("bad line\n= Safari\nx.com =\n!Safari\n", "x.com", "/"), None);
     }

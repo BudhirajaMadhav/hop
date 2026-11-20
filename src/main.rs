@@ -3,9 +3,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use block2::RcBlock;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -17,13 +21,15 @@ use objc2_app_kit::{
     NSFontWeightSemibold, NSForegroundColorAttributeName, NSGlassEffectView, NSGraphicsContext,
     NSImage, NSLineBreakMode, NSMenu, NSMenuItem, NSMutableParagraphStyle, NSPanel,
     NSParagraphStyleAttributeName,
-    NSPasteboard, NSPasteboardTypeString, NSPopUpMenuWindowLevel, NSResponder, NSScreen,
+    NSPasteboard, NSPasteboardTypeString, NSPopUpMenuWindowLevel, NSResponder, NSRunningApplication,
+    NSScreen,
     NSStringDrawing, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
-    ns_string, NSArray, NSAttributedStringKey, NSBundle, NSCopying, NSDictionary, NSFileManager,
-    NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+    ns_string, NSArray, NSAttributedStringKey, NSBundle, NSCopying, NSDate, NSDictionary, NSError,
+    NSFileManager, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop, NSSize,
+    NSString, NSURL,
 };
 
 const BUNDLE_ID: &str = "local.hop";
@@ -42,9 +48,10 @@ const TRACKERS: &[&str] = &[
 const RULES_TEMPLATE: &str = "\
 # Hop rules: <domain[/path]> = <picker label | app name>
 # First match wins. Subdomains match. Tick Remember (or hold ⌥) while picking to add one.
-# `+<label>` pins a top choice, in order (⌘1, ⌘2, …). Everything else goes under More (0).
+# `+<label>` marks a favorite: a top choice, in order (⌘1, ⌘2, …). `hop favorites` sets them.
+# Everything that is not a favorite goes under More (0).
 # `!<label>` hides a row. An app name in a `+`/`!` line covers all of its profiles.
-# `hop --list` prints the labels.
+# `hop list` prints the labels. `hop rules` opens this file.
 #
 # +Google Chrome (Work)
 # +Safari
@@ -186,21 +193,8 @@ define_class!(
     unsafe impl NSApplicationDelegate for Hop {
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _n: &NSNotification) {
-            // `hop <url>` from a terminal routes the URL and skips the default-browser check.
-            let args: Vec<String> = std::env::args().skip(1).filter(|a| a.starts_with("http")).collect();
-            if !args.is_empty() {
-                return args.iter().for_each(|u| self.route(u));
-            }
-            let me = NSBundle::mainBundle();
-            if me.bundleIdentifier().is_none_or(|id| id.to_string() != BUNDLE_ID) {
-                return;
-            }
-            let ws = NSWorkspace::sharedWorkspace();
-            let current = ws.URLForApplicationToOpenURL(&probe()).and_then(|u| NSBundle::bundleWithURL(&u)).and_then(|b| b.bundleIdentifier());
-            if current.is_none_or(|id| id.to_string() != BUNDLE_ID) {
-                // macOS asks the user to confirm. The web-browser role covers http and https.
-                ws.setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler(&me.bundleURL(), ns_string!("http"), None);
-            }
+            // Dev only: `HOP_SNAPSHOT=out.png target/debug/hop <url>` routes the URL in this process.
+            std::env::args().skip(1).filter(|a| a.starts_with("http")).for_each(|u| self.route(&u));
         }
 
         #[unsafe(method(application:openURLs:))]
@@ -272,7 +266,7 @@ impl Hop {
         let parsed = NSURL::URLWithString(&NSString::from_str(&url));
         let host = parsed.as_ref().and_then(|u| u.host()).map(|h| h.to_string().to_lowercase()).unwrap_or_default();
         let path = parsed.as_ref().and_then(|u| u.path()).map(|p| p.to_string()).unwrap_or_default();
-        let rules = fs::read_to_string(rules_path()).unwrap_or_default();
+        let rules = read_rules();
         let (targets, n_top) = targets(&rules);
         if let Some(want) = find_rule(&rules, &host, &path) {
             if let Some(t) = targets.iter().find(|t| t.label().eq_ignore_ascii_case(&want)) {
@@ -305,7 +299,7 @@ impl Hop {
         st.alt.set(NSEvent::modifierFlags_class().contains(NSEventModifierFlags::Option));
         st.remember.set(false);
         self.setNeedsDisplay(true);
-        #[cfg(debug_assertions)] // dev only: `HOP_SNAPSHOT=out.png hop <url>` renders the picker without showing it
+        #[cfg(debug_assertions)] // dev only: `HOP_SNAPSHOT=out.png target/debug/hop <url>` renders the picker without showing it
         if let Some(out) = std::env::var("HOP_SNAPSHOT").ok() {
             let rep = self.bitmapImageRepForCachingDisplayInRect(self.bounds()).unwrap();
             self.cacheDisplayInRect_toBitmapImageRep(self.bounds(), &rep);
@@ -666,6 +660,17 @@ fn rules_path() -> PathBuf {
     home().join(".config/hop/rules")
 }
 
+fn read_rules() -> String {
+    fs::read_to_string(rules_path()).unwrap_or_else(|_| RULES_TEMPLATE.into())
+}
+
+/// Replaces the `+` lines of `rules` with `labels`, in order. Keeps every other line.
+fn set_favorites(rules: &str, labels: &[String]) -> String {
+    let mut out: String = rules.lines().filter(|l| !l.trim_start().starts_with('+')).map(|l| format!("{l}\n")).collect();
+    out.extend(labels.iter().map(|l| format!("+{l}\n")));
+    out
+}
+
 fn find_rule(rules: &str, host: &str, path: &str) -> Option<String> {
     let path = path.to_lowercase();
     rules.lines().find_map(|line| {
@@ -734,14 +739,329 @@ fn clean(url: &str) -> (String, usize) {
     (format!("{head}{q}{frag}"), removed)
 }
 
-fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--list") {
-        let rules = fs::read_to_string(rules_path()).unwrap_or_default();
-        let (targets, n_top) = targets(&rules);
-        for (i, t) in targets.iter().enumerate() {
-            println!("{}{}", if i < n_top && n_top < targets.len() { "+" } else { "" }, t.label());
+// The `hop` command. `./bundle.sh install` links it into ~/.local/bin.
+
+const APP_PATH: &str = "/Applications/Hop.app";
+
+const HELP: &str = "\
+hop: a link router for macOS
+
+  hop <url>        open a link through Hop
+  hop favorites    pick the browsers and profiles at the top of the picker
+  hop default      make Hop the default browser
+  hop rules        open the rules file (~/.config/hop/rules)
+  hop list         print the picker labels (+ marks a favorite)
+  hop uninstall    give your links back to another browser, then remove Hop
+";
+
+fn cli(args: &[String]) {
+    match args.first().map(String::as_str) {
+        Some("favorites" | "favourites") => favorites(),
+        Some("default") => make_default(),
+        Some("rules") => {
+            println!("{}", rules_path().display());
+            edit_rules();
         }
-        return;
+        Some("list") => list(),
+        Some("uninstall") => uninstall(),
+        Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+            installed_or_exit();
+            let _ = Command::new("/usr/bin/open").args(["-a", APP_PATH, url]).status();
+        }
+        Some("help" | "-h" | "--help") | None => print!("{HELP}"),
+        Some(other) => {
+            eprint!("hop: unknown command `{other}`\n\n{HELP}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn installed_or_exit() -> Retained<NSURL> {
+    if !PathBuf::from(APP_PATH).exists() {
+        eprintln!("Hop is not installed. Run: ./bundle.sh install");
+        std::process::exit(1);
+    }
+    NSURL::fileURLWithPath(&NSString::from_str(APP_PATH))
+}
+
+fn list() {
+    let (targets, n_top) = targets(&read_rules());
+    for (i, t) in targets.iter().enumerate() {
+        println!("{}{}", if i < n_top && n_top < targets.len() { "+" } else { "" }, t.label());
+    }
+}
+
+/// Puts the terminal in key-at-a-time mode until dropped. `None` when stdin is not a terminal.
+struct RawTerminal(String);
+
+impl RawTerminal {
+    fn on() -> Option<Self> {
+        if !io::stdin().is_terminal() {
+            return None;
+        }
+        let saved = stty(&["-g"])?;
+        // -isig: Ctrl-C arrives as a key, so the terminal is always restored. time 1: reads time out after 0.1 s.
+        stty(&["-icanon", "-echo", "-isig", "min", "0", "time", "1"])?;
+        Some(Self(saved))
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        stty(&[&self.0]);
+        print!("\x1b[?25h");
+        let _ = io::stdout().flush();
+    }
+}
+
+fn stty(args: &[&str]) -> Option<String> {
+    let out = Command::new("stty").args(args).stdin(std::process::Stdio::inherit()).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[derive(PartialEq)]
+enum Key {
+    Up,
+    Down,
+    MoveUp,   // Shift+↑ or K
+    MoveDown, // Shift+↓ or J
+    Space,
+    Enter,
+    Quit,
+    Other,
+}
+
+fn read_byte(stdin: &mut impl Read) -> Option<u8> {
+    let mut b = [0u8; 1];
+    (stdin.read(&mut b).ok()? == 1).then_some(b[0])
+}
+
+fn read_key(stdin: &mut impl Read) -> Key {
+    let first = loop {
+        if let Some(b) = read_byte(stdin) {
+            break b;
+        }
+    };
+    match first {
+        b'\r' | b'\n' => Key::Enter,
+        b' ' => Key::Space,
+        b'k' => Key::Up,
+        b'j' => Key::Down,
+        b'K' => Key::MoveUp,
+        b'J' => Key::MoveDown,
+        b'q' | 3 | 4 => Key::Quit, // q, Ctrl-C, Ctrl-D
+        27 => {
+            // An escape sequence ends with a letter or `~`. Nothing within 0.1 s means Esc on its own.
+            let mut seq = Vec::new();
+            while let Some(b) = read_byte(stdin) {
+                seq.push(b);
+                if b.is_ascii_alphabetic() || b == b'~' || seq.len() > 6 {
+                    break;
+                }
+            }
+            match seq.as_slice() {
+                [] => Key::Quit,
+                b"[A" | b"OA" => Key::Up,
+                b"[B" | b"OB" => Key::Down,
+                [b'[', b'1', b';', _, b'A'] => Key::MoveUp, // ↑ with Shift (or another modifier)
+                [b'[', b'1', b';', _, b'B'] => Key::MoveDown,
+                _ => Key::Other,
+            }
+        }
+        _ => Key::Other,
+    }
+}
+
+/// A terminal list picker. With `multi`, space adds or removes a row, Shift+↑↓ reorders the added rows,
+/// and the result is in that order; `picked` is the starting selection, and the added rows show first.
+/// Without `multi`, Enter picks the row under the cursor, which starts on `picked[0]`.
+/// `None` means the user cancelled, or there is no terminal.
+fn choose(title: &str, items: &[String], mut picked: Vec<usize>, multi: bool) -> Option<Vec<usize>> {
+    let n = items.len();
+    if n == 0 {
+        return None;
+    }
+    let _raw = RawTerminal::on()?;
+    let mut stdin = io::stdin().lock();
+    let mut out = io::stdout();
+    let mut cur = picked.first().copied().unwrap_or(0).min(n - 1); // an item index: the cursor follows its row
+    let help = if multi {
+        "↑↓ move · space add/remove · shift+↑↓ reorder · enter save · q cancel"
+    } else {
+        "↑↓ move · enter choose · q cancel"
+    };
+    print!("\x1b[?25l{title}\n\x1b[2m{help}\x1b[0m\n");
+    for first in std::iter::once(true).chain(std::iter::repeat(false)) {
+        let view: Vec<usize> = match multi {
+            true => picked.iter().copied().chain((0..n).filter(|i| !picked.contains(i))).collect(),
+            false => (0..n).collect(),
+        };
+        let pos = view.iter().position(|&i| i == cur).unwrap_or(0);
+        if !first {
+            print!("\x1b[{n}A"); // back to the top of the list, then redraw it
+        }
+        for &i in &view {
+            let mark = match picked.iter().position(|&p| p == i) {
+                _ if !multi => String::new(),
+                Some(rank) => format!("\x1b[36m{:>2}\x1b[0m ", rank + 1),
+                None => "\x1b[2m ·\x1b[0m ".into(),
+            };
+            let (arrow, bold) = if i == cur { ("\x1b[36m›\x1b[0m", "\x1b[1m") } else { (" ", "") };
+            print!("\r\x1b[2K {arrow} {mark}{bold}{}\x1b[0m\n", items[i]);
+        }
+        let _ = out.flush();
+        let rank = picked.iter().position(|&p| p == cur);
+        match read_key(&mut stdin) {
+            Key::Up => cur = view[(pos + n - 1) % n],
+            Key::Down => cur = view[(pos + 1) % n],
+            Key::Space if multi => match rank {
+                Some(r) => drop(picked.remove(r)),
+                None => picked.push(cur),
+            },
+            Key::MoveUp if multi => {
+                if let Some(r) = rank.filter(|&r| r > 0) {
+                    picked.swap(r, r - 1);
+                }
+            }
+            Key::MoveDown if multi => {
+                if let Some(r) = rank.filter(|&r| r + 1 < picked.len()) {
+                    picked.swap(r, r + 1);
+                }
+            }
+            Key::Enter => return Some(if multi { picked } else { vec![cur] }),
+            Key::Quit => return None,
+            _ => {}
+        }
+    }
+    unreachable!()
+}
+
+fn favorites() {
+    let rules = read_rules();
+    let (targets, n_top) = targets(&rules);
+    let items: Vec<String> = targets.iter().map(|t| t.label()).collect();
+    let current = if n_top < targets.len() { (0..n_top).collect() } else { Vec::new() };
+    let title = "Pick your favorites. They go at the top of the picker, in this order.";
+    let Some(picked) = choose(title, &items, current, true) else {
+        return println!("Kept the current favorites.");
+    };
+    let labels: Vec<String> = picked.iter().map(|&i| items[i].clone()).collect();
+    let p = rules_path();
+    let _ = fs::create_dir_all(p.parent().unwrap());
+    match fs::write(&p, set_favorites(&rules, &labels)) {
+        Ok(()) if labels.is_empty() => println!("No favorites: the picker shows every browser."),
+        Ok(()) => println!("Favorites: {}", labels.join(", ")),
+        Err(e) => eprintln!("Could not write {}: {e}", p.display()),
+    }
+}
+
+/// The bundle id and name of the app that opens `scheme` links now.
+fn handler(scheme: &str) -> Option<(String, String)> {
+    let url = NSURL::URLWithString(&NSString::from_str(&format!("{scheme}://example.com")))?;
+    let app = NSWorkspace::sharedWorkspace().URLForApplicationToOpenURL(&url)?;
+    let id = NSBundle::bundleWithURL(&app)?.bundleIdentifier()?.to_string();
+    let name = NSFileManager::defaultManager().displayNameAtPath(&*app.path()?).to_string();
+    Some((id, name.trim_end_matches(".app").to_string()))
+}
+
+fn is_default(id: &str) -> bool {
+    ["http", "https"].iter().all(|s| handler(s).is_some_and(|(h, _)| h == id))
+}
+
+/// Asks macOS to make `app` the default browser. macOS shows its own dialog; this waits for the answer.
+fn set_default(app: &NSURL, id: &str) -> bool {
+    for scheme in ["http", "https"] {
+        if handler(scheme).is_some_and(|(h, _)| h == id) {
+            continue; // the http change usually moves https too
+        }
+        let (tx, rx) = mpsc::channel();
+        let done = RcBlock::new(move |_err: *mut NSError| {
+            let _ = tx.send(());
+        });
+        NSWorkspace::sharedWorkspace().setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler(app, &NSString::from_str(scheme), Some(&done));
+        let deadline = Instant::now() + Duration::from_secs(300);
+        while rx.try_recv().is_err() && Instant::now() < deadline {
+            NSRunLoop::currentRunLoop().runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.1));
+        }
+    }
+    is_default(id)
+}
+
+fn make_default() {
+    let app = installed_or_exit();
+    if is_default(BUNDLE_ID) {
+        return println!("Hop is already the default browser.");
+    }
+    println!("macOS asks you to confirm. Choose “Use “Hop””.");
+    if set_default(&app, BUNDLE_ID) {
+        println!("Hop is now the default browser.");
+    } else {
+        let now = handler("https").map_or("another app".into(), |(_, name)| name);
+        println!("{now} is still the default browser. Run `hop default` to ask again.");
+    }
+}
+
+/// The user picks the browser that gets the links back. Returns false if Hop is still the default.
+fn restore_default() -> bool {
+    if !["http", "https"].iter().any(|s| handler(s).is_some_and(|(h, _)| h == BUNDLE_ID)) {
+        return true;
+    }
+    let (targets, _) = targets(&read_rules());
+    let mut apps: Vec<(String, String)> = Vec::new(); // (name, path), one per app
+    for t in &targets {
+        if !apps.iter().any(|(_, path)| *path == t.app) {
+            apps.push((if t.profile.is_some() { &t.detail } else { &t.name }.clone(), t.app.clone()));
+        }
+    }
+    apps.sort_by_key(|(name, _)| name.to_lowercase());
+    let safari = apps.iter().position(|(name, _)| name == "Safari").unwrap_or(0);
+    let names: Vec<String> = apps.iter().map(|(name, _)| name.clone()).collect();
+    let pick = if io::stdin().is_terminal() {
+        match choose("Which browser gets your links after Hop is gone?", &names, vec![safari], false) {
+            Some(p) => p[0],
+            None => return false,
+        }
+    } else {
+        safari
+    };
+    let Some((name, path)) = apps.get(pick) else {
+        eprintln!("Hop found no other browser. Pick one in System Settings → Desktop & Dock.");
+        return false;
+    };
+    let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+    let id = NSBundle::bundleWithURL(&url).and_then(|b| b.bundleIdentifier()).map(|s| s.to_string()).unwrap_or_default();
+    println!("macOS asks you to confirm. Choose “Use “{name}””.");
+    set_default(&url, &id)
+}
+
+fn uninstall() {
+    installed_or_exit();
+    if !restore_default() {
+        return eprintln!("Hop is still the default browser, so Hop stays installed.");
+    }
+    for app in NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(BUNDLE_ID)).iter() {
+        if app.processIdentifier() as u32 != std::process::id() {
+            app.terminate();
+        }
+    }
+    let lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+    let _ = Command::new(lsregister).args(["-u", APP_PATH]).status();
+    if let Err(e) = fs::remove_dir_all(APP_PATH) {
+        return eprintln!("Could not remove {APP_PATH}: {e}");
+    }
+    let link = home().join(".local/bin/hop");
+    if fs::read_link(&link).is_ok_and(|target| target.starts_with(APP_PATH)) {
+        let _ = fs::remove_file(&link);
+    }
+    println!("Removed Hop. Your rules are still in {}.", rules_path().display());
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // LaunchServices starts the app with no arguments and no terminal. Anything else is the `hop` command.
+    let snapshot = cfg!(debug_assertions) && std::env::var_os("HOP_SNAPSHOT").is_some();
+    if !snapshot && (!args.is_empty() || io::stdin().is_terminal()) {
+        return cli(&args);
     }
     let mtm = MainThreadMarker::new().expect("main thread");
     let app = NSApplication::sharedApplication(mtm);
@@ -762,6 +1082,13 @@ mod tests {
         assert_eq!(clean("https://a.com/x?utm_source=t&id=1&fbclid=z#top"), ("https://a.com/x?id=1#top".into(), 2));
         assert_eq!(clean("https://a.com/?UTM_Medium=x&gclid=1"), ("https://a.com/".into(), 2));
         assert_eq!(clean("https://a.com/#/r?utm_source=t"), ("https://a.com/#/r?utm_source=t".into(), 0));
+    }
+
+    #[test]
+    fn favorites_replace_only_the_pin_lines() {
+        let rules = "# +Safari (an example)\n+Old\nyoutube.com = Safari\n  +Older\n!Spotify";
+        let want = "# +Safari (an example)\nyoutube.com = Safari\n!Spotify\n+A\n+B (C)\n";
+        assert_eq!(set_favorites(rules, &["A".into(), "B (C)".into()]), want);
     }
 
     #[test]

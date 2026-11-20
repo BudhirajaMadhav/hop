@@ -5,9 +5,21 @@ A tiny link router for macOS 26, written in Rust. It is a native AppKit app with
 Make Hop your default browser. Each link then follows a rule, or it opens a Liquid Glass picker under the cursor.
 
 ```sh
-./bundle.sh            # builds target/Hop.app
-./bundle.sh install    # also replaces /Applications/Hop.app and opens it; the first time, macOS asks to make it the default browser
+./bundle.sh install   # installs Hop.app and the `hop` command, asks for your favorites, then asks to make Hop the default browser
 ```
+
+Then use the `hop` command:
+
+```sh
+hop favorites   # pick and order the browsers and profiles at the top of the picker (↑↓, space, shift+↑↓, enter)
+hop default     # make Hop the default browser (macOS asks you to confirm)
+hop rules       # open the rules file
+hop list        # print the picker labels
+hop <url>       # open a link through Hop
+hop uninstall   # give your links back to a browser you choose, then remove Hop
+```
+
+A reinstall keeps Hop as the default browser, because macOS stores the bundle ID, not the file.
 
 **Picker:** `1`–`9` (or `⌘1`–`⌘9`) or a click opens a top choice · `0` opens More, a menu of the rest · `↩` opens the selected row · `space` or a click ticks Remember for this domain (holding `⌥` does the same) · `⌘C` copies the link · `esc` closes · `⌘,` opens the rules file · `⌘Q` quits.
 
@@ -22,4 +34,4 @@ figma.com = Figma
 !T3 Code (Beta)                            # hide a row
 ```
 
-Hop also removes tracking parameters (`utm_*`, `fbclid`, `gclid`, …) before it opens a link. `hop --list` prints the picker labels.
+Hop also removes tracking parameters (`utm_*`, `fbclid`, `gclid`, …) before it opens a link. `hop list` prints the picker labels.

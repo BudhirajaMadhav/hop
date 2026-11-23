@@ -1,14 +1,10 @@
 #!/bin/sh
 # ./bundle.sh          build target/Hop.app
-# ./bundle.sh install  build, install Hop.app and the `hop` command, pick favorites, make Hop the default browser
+# ./bundle.sh install  build, then install it with ./install.sh (favorites, default browser)
+# ./bundle.sh release  build, then publish target/Hop.tar.gz as a GitHub release for the one-line install
 # After that, use the `hop` command (`hop help`).
 set -e
 cd "$(dirname "$0")"
-APP=/Applications/Hop.app
-HOP=$APP/Contents/MacOS/hop
-BIN=$HOME/.local/bin
-LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-
 cargo build --release
 rm -rf target/Hop.app
 mkdir -p target/Hop.app/Contents/MacOS
@@ -19,18 +15,9 @@ echo "built target/Hop.app"
 
 case "${1:-}" in
   "") ;;
-  install)
-    pkill -x hop || true # a running copy keeps the old code
-    rm -rf "$APP"
-    cp -R target/Hop.app "$APP"
-    "$LSREGISTER" -u target/Hop.app 2>/dev/null || true # links must never open the build copy
-    "$LSREGISTER" -f "$APP"
-    mkdir -p "$BIN"
-    ln -sf "$HOP" "$BIN/hop"
-    case ":$PATH:" in *":$BIN:"*) ;; *) echo "Add $BIN to your PATH to use the hop command." ;; esac
-    "$HOP" favorites
-    "$HOP" default
-    open "$APP"
-    echo "installed $APP and $BIN/hop" ;;
-  *) sed -n '2,4p' "$0" | sed 's/^# //'; exit 1 ;;
+  install) ./install.sh target/Hop.app ;;
+  release)
+    COPYFILE_DISABLE=1 tar -czf target/Hop.tar.gz -C target Hop.app # no ._ metadata files
+    gh release create "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)" target/Hop.tar.gz --generate-notes ;;
+  *) sed -n '2,5p' "$0" | sed 's/^# //'; exit 1 ;;
 esac

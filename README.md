@@ -13,9 +13,15 @@ Make Hop your default browser. Each link then follows a rule, or it opens a Liqu
 
 You click a link, and the picker opens with the first row under the cursor. Press `1`, or click, to open the link in that browser or profile. Tick Remember to send every link for that site there from now on.
 
+Install it with one command. It needs macOS 26 on Apple silicon, and no Rust:
+
 ```sh
-./bundle.sh install   # installs Hop.app and the `hop` command, asks for your favorites, then asks to make Hop the default browser
+curl -fsSL https://raw.githubusercontent.com/BudhirajaMadhav/hop/master/install.sh | sh
 ```
+
+The command downloads Hop.app and installs it with the `hop` command. It asks for your favorites, then asks macOS to make Hop the default browser. Click "Use Hop" when macOS asks.
+
+To build from source, clone the repo and run `./bundle.sh install`. This needs Rust. `./bundle.sh release` publishes the build as the GitHub release that the command downloads.
 
 Then use the `hop` command:
 
